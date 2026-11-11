@@ -1,0 +1,105 @@
+// backend/src/models/Enquiry.js
+
+const mongoose = require("mongoose");
+
+const EnquirySchema = new mongoose.Schema(
+  {
+    // Customer's phone number
+    phoneNumber: {
+      type: String,
+    },
+    // Business-scoped User ID (BSUID)
+    bsuid: {
+      type: String,
+      trim: true,
+    },
+    // WhatsApp Username
+    username: {
+      type: String,
+      trim: true,
+    },
+
+    // The business phone number (recipientId) they contacted
+    recipientId: {
+      type: String,
+      required: true,
+    },
+
+    name: { type: String, trim: true },
+    projectName: { type: String, trim: true },
+    location: { type: String, trim: true },
+    pageUrl: { type: String, trim: true },
+    budget: { type: String, trim: true },
+    bedrooms: { type: String, trim: true },
+    intent: { type: String, trim: true }, // Investment / Living
+    entrySource: { type: String, trim: true }, // Campaign Name / Direct
+    propertyType: { type: String, trim: true }, // Villa / Apartment
+
+    // Tracks the bot's progress
+    conversationState: {
+      type: String,
+      default: "awaiting_name",
+    },
+
+    // enquiry status: pending / contacted / closed (your own)
+    status: {
+      type: String,
+      default: "pending",
+    },
+
+    // Preferred Language (en / ar)
+    language: {
+      type: String,
+      default: "en",
+    },
+
+    // -----------------------------
+    // END LOGIC FIELDS
+    // -----------------------------
+
+    // Has the user completed the flow?
+    endedAt: {
+      type: Date,
+      default: null,
+    },
+
+    // Did the bot already send the END node message?
+    endMessageSent: {
+      type: Boolean,
+      default: false,
+    },
+
+    // -----------------------------
+    // REVIEW SYSTEM FIELDS
+    // -----------------------------
+    reviewStatus: {
+      type: String,
+      enum: ["PENDING", "RATED", "DETAILS_PROVIDED", "SKIPPED"],
+      default: null,
+    },
+    reviewRating: {
+      type: Number,
+      default: null,
+    },
+    reviewText: {
+      type: String,
+      trim: true,
+      default: null,
+    },
+
+    // Skip asking for name if we already have it from previous enquiry
+    skipName: {
+      type: Boolean,
+      default: false,
+    },
+  },
+  {
+    timestamps: true,
+  }
+);
+
+// Allow multiple enquiries for same phone number over time
+EnquirySchema.index({ phoneNumber: 1, recipientId: 1 });
+EnquirySchema.index({ bsuid: 1, recipientId: 1 });
+
+module.exports = mongoose.model("Enquiry", EnquirySchema);
