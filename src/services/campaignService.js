@@ -15,11 +15,22 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const campaignStateMap = new Map();
 
 const pauseCampaign = (campaignId) => {
-  campaignStateMap.set(String(campaignId), "paused");
+  const idStr = String(campaignId);
+  // Only mark as paused in memory if there is actually an active background loop for this campaign
+  if (campaignStateMap.has(idStr)) {
+    campaignStateMap.set(idStr, "paused");
+    return true;
+  }
+  return false;
 };
 
 const resumeCampaign = (campaignId) => {
-  campaignStateMap.set(String(campaignId), "running");
+  const idStr = String(campaignId);
+  if (campaignStateMap.has(idStr)) {
+    campaignStateMap.set(idStr, "running");
+    return true;
+  }
+  return false;
 };
 
 const getCampaignState = (campaignId) => {
@@ -28,8 +39,25 @@ const getCampaignState = (campaignId) => {
 
 // Waits while campaign is paused, resolves when running again
 const waitWhilePaused = async (campaignId) => {
-  while (getCampaignState(campaignId) === "paused") {
-    await sleep(2000); // poll every 2 seconds
+  if (getCampaignState(campaignId) === "paused") {
+    console.log(`⏸️ Campaign ${campaignId} is paused. Waiting for resume...`);
+    while (getCampaignState(campaignId) === "paused") {
+      await sleep(1000); // poll every 1 second
+    }
+    console.log(`▶️ Campaign ${campaignId} resumed! Continuing execution...`);
+  }
+};
+
+// Interruptible sleep that wakes up immediately if campaign is paused
+const sleepInterruptible = async (ms, campaignId) => {
+  let remaining = ms;
+  while (remaining > 0) {
+    if (getCampaignState(campaignId) === "paused") {
+      break;
+    }
+    const step = Math.min(remaining, 1000);
+    await sleep(step);
+    remaining -= step;
   }
 };
 
@@ -118,6 +146,13 @@ const processCampaignBackground = async (campaignId, options = {}) => {
       .filter((a) => a.contact && a.contact.phoneNumber)
       .map((a) => a.contact.phoneNumber);
 
+    // Contacts already processed in THIS specific campaign (so we don't mark already-sent contacts as 'skipped' on resume)
+    const alreadyProcessedContactIdsInThisCampaign = new Set(
+      analyticsWithPhones
+        .filter((a) => String(a.campaign) === idStr && a.contact)
+        .map((a) => String(a.contact._id)),
+    );
+
     // Build the final query excluding numbers
     const allNumbersToSkip = [
       ...new Set([...excludedPhoneNumbers, ...phoneNumbersWhoReceivedTemplate]),
@@ -134,8 +169,12 @@ const processCampaignBackground = async (campaignId, options = {}) => {
           phoneNumber: { $in: allNumbersToSkip },
         }).select("_id");
 
-        if (skippedContacts.length > 0) {
-          const skippedRecords = skippedContacts.map((contact) => ({
+        const newlySkippedContacts = skippedContacts.filter(
+          (contact) => !alreadyProcessedContactIdsInThisCampaign.has(String(contact._id)),
+        );
+
+        if (newlySkippedContacts.length > 0) {
+          const skippedRecords = newlySkippedContacts.map((contact) => ({
             wamid: `skipped_${campaign._id}_${contact._id}`,
             campaign: campaign._id,
             contact: contact._id,
@@ -145,7 +184,7 @@ const processCampaignBackground = async (campaignId, options = {}) => {
           // ordered:false → continue even if some wamids already exist (resume case)
           await Analytics.insertMany(skippedRecords, { ordered: false });
           console.log(
-            `📊 Recorded ${skippedContacts.length} skipped contacts for campaign "${campaign.name}".`,
+            `📊 Recorded ${newlySkippedContacts.length} skipped contacts for campaign "${campaign.name}".`,
           );
         }
       } catch (err) {
@@ -306,7 +345,7 @@ const processCampaignBackground = async (campaignId, options = {}) => {
         }
 
         // Message Delay between individual messages
-        if (messageDelay > 0) await sleep(messageDelay);
+        if (messageDelay > 0) await sleepInterruptible(messageDelay, idStr);
       }
 
       offset += batchSize;
@@ -314,7 +353,7 @@ const processCampaignBackground = async (campaignId, options = {}) => {
       // Batch Delay before next batch
       if (offset < totalContactsToProcess) {
         console.log(`Waiting ${batchDelay}ms before next batch...`);
-        await sleep(batchDelay);
+        await sleepInterruptible(batchDelay, idStr);
       }
     }
 

@@ -65,8 +65,21 @@ const getRecipientCount = async (req, res) => {
   }
 };
 
+// In-memory lock to prevent duplicate campaign creation & duplicate Meta media uploads on rapid double-clicks
+const activeCampaignCreations = new Set();
+const fs = require("fs");
+
 // --- THIS IS THE CORRECTED FUNCTION ---
 const createCampaign = async (req, res) => {
+  let creationKey = null;
+  const cleanupUploadedFile = () => {
+    if (req.file && req.file.path && fs.existsSync(req.file.path)) {
+      try {
+        fs.unlinkSync(req.file.path);
+      } catch (e) {}
+    }
+  };
+
   try {
     const {
       name,
@@ -103,10 +116,37 @@ const createCampaign = async (req, res) => {
     }
 
     if (!phoneNumber || !contactList) {
+      cleanupUploadedFile();
       return res.status(400).json({
         success: false,
         error: '"Send From" and "Send To" are required.',
       });
+    }
+
+    // --- DEDUPLICATION GUARD (Prevents 3x Meta upload & duplicate campaigns on multiple clicks) ---
+    creationKey = `${req.user?._id || "anon"}:${(name || "").trim().toLowerCase()}:${templateName}:${phoneNumber}:${contactList}`;
+    if (activeCampaignCreations.has(creationKey)) {
+      cleanupUploadedFile();
+      return res.status(429).json({
+        success: false,
+        error: "Campaign creation is already in progress. Please wait.",
+      });
+    }
+    activeCampaignCreations.add(creationKey);
+
+    // Also check if an identical campaign was just created within the last 30 seconds
+    const thirtySecondsAgo = new Date(Date.now() - 30 * 1000);
+    const recentDuplicate = await Campaign.findOne({
+      name,
+      templateName,
+      phoneNumber,
+      contactList,
+      createdAt: { $gte: thirtySecondsAgo },
+    });
+
+    if (recentDuplicate) {
+      cleanupUploadedFile();
+      return res.status(200).json({ success: true, data: recentDuplicate });
     }
 
     // --- NEW LOGIC: UPLOAD TO META ---
@@ -183,8 +223,13 @@ const createCampaign = async (req, res) => {
 
     res.status(201).json({ success: true, data: campaign });
   } catch (error) {
+    cleanupUploadedFile();
     console.error("Error creating campaign:", error);
     res.status(400).json({ success: false, error: error.message });
+  } finally {
+    if (creationKey) {
+      activeCampaignCreations.delete(creationKey);
+    }
   }
 };
 
@@ -211,12 +256,16 @@ const executeCampaign = async (req, res) => {
     }
 
     // Prevent re-sending already processed campaigns
-    if (["sending", "sent"].includes(campaign.status)) {
+    if (["sending", "sent"].includes(campaign.status) || isCampaignActive(campaign._id)) {
       return res.status(400).json({
         success: false,
-        error: `This campaign has already been ${campaign.status}.`,
+        error: `This campaign has already been ${campaign.status === "sent" ? "sent" : "started"}.`,
       });
     }
+
+    campaign.status = "sending";
+    await campaign.save();
+    getIO().emit("campaignsUpdated");
 
     // Log that manual send started
     await Log.create({

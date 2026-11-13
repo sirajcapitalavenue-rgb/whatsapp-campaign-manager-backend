@@ -12,13 +12,15 @@ const router = express.Router();
 // All routes are protected
 router.use(protect);
 
-router.route("/:wabaId").get(getTemplates);
+router
+  .route("/:wabaId")
+  .get(authorize("admin", "manager"), getTemplates);
 router
   .route("/:wabaId/analytics")
-  .get(authorize("admin"), getTemplateAnalytics);
+  .get(authorize("admin", "manager"), getTemplateAnalytics);
 
-router.route("/").post(authorize("admin"), createTemplate);
+router.route("/").post(authorize("admin", "manager"), createTemplate);
 
-router.route("/:templateId").put(authorize("admin"), editTemplate);
+router.route("/:templateId").put(authorize("admin", "manager"), editTemplate);
 
 module.exports = router;

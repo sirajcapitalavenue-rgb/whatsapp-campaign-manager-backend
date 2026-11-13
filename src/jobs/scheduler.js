@@ -3,12 +3,42 @@
 const cron = require("node-cron");
 const Campaign = require("../models/Campaign");
 const Enquiry = require("../models/Enquiry");
-const { sendCampaign } = require("../services/campaignService");
+const { sendCampaign, isCampaignActive } = require("../services/campaignService");
 const Log = require("../models/Log");
 const { getIO } = require("../socketManager");
 
+// Automatically recover any campaigns that were in "sending" status when the backend restarted
+const resumeInterruptedCampaigns = async () => {
+  try {
+    const sendingCampaigns = await Campaign.find({ status: "sending" });
+    for (const campaign of sendingCampaigns) {
+      if (!isCampaignActive(campaign._id)) {
+        console.log(
+          `🔄 Auto-resuming interrupted campaign "${campaign.name}" (${campaign._id})...`,
+        );
+        await Log.create({
+          level: "info",
+          message: `Auto-resuming interrupted campaign "${campaign.name}" after server restart.`,
+          campaign: campaign._id,
+        });
+        sendCampaign(campaign._id).catch((err) => {
+          console.error(
+            `Error auto-resuming campaign ${campaign._id}:`,
+            err.message,
+          );
+        });
+      }
+    }
+  } catch (error) {
+    console.error("Error checking for interrupted campaigns:", error);
+  }
+};
+
 const startScheduler = () => {
   console.log('⏰ Starting all schedulers...');
+
+  // Recover any interrupted "sending" campaigns shortly after server boot
+  setTimeout(resumeInterruptedCampaigns, 5000);
 
   // ---------------------------------------------------------
   // 1. CAMPAIGN SCHEDULER (Runs every 1 minute)
@@ -52,6 +82,9 @@ const startScheduler = () => {
           });
         });
       }
+
+      // Also check if any "sending" campaign lost its in-memory worker and auto-resume it
+      await resumeInterruptedCampaigns();
     } catch (error) {
       console.error("Error in campaign scheduler:", error);
     }
