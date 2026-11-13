@@ -132,6 +132,22 @@ const processCampaignBackground = async (campaignId, options = {}) => {
     }).select("_id");
     const campaignIds = campaignsWithSameTemplate.map((c) => c._id);
 
+    // Clean up any previous failed records on THIS campaign caused by expired/invalid Media ID (400) so they can be retried after Media ID auto-recovery
+    try {
+      const cleaned = await Analytics.deleteMany({
+        campaign: campaignId,
+        status: "failed",
+        failureReason: { $regex: /status code 400|does not exist or has expired/i },
+      });
+      if (cleaned.deletedCount > 0) {
+        console.log(
+          `🧹 Cleared ${cleaned.deletedCount} expired-media failed records for campaign "${campaign.name}" so they can be retried.`,
+        );
+      }
+    } catch (cleanErr) {
+      console.warn("Warning cleaning expired-media failed records:", cleanErr.message);
+    }
+
     // We want to skip:
     // 1. Any SUCCESSFUL/PENDING message from ANY campaign using this template (status != "failed")
     // 2. ANY message (even failed) from THIS EXACT campaign, so we don't infinitely loop on them when resuming.
@@ -258,11 +274,10 @@ const processCampaignBackground = async (campaignId, options = {}) => {
             campaign.templateName,
             campaign.templateLanguage,
             {
-              // Prefer the stored Meta media ID; fall back to URL if no ID
+              campaignId: campaign._id,
+              // Pass both headerMediaId and headerImageUrl so sendTemplateMessage can fall back to URL if Media ID expired
               headerMediaId: campaign.headerMediaId || undefined,
-              headerImageUrl: campaign.headerMediaId
-                ? undefined
-                : campaign.headerImageUrl,
+              headerImageUrl: campaign.headerImageUrl || undefined,
               headerMediaType: campaign.headerMediaType,
               bodyVariables: finalBodyVariables,
               buttons: campaign.buttons,
@@ -323,9 +338,24 @@ const processCampaignBackground = async (campaignId, options = {}) => {
             });
           }
         } catch (error) {
+          const metaError = error.response?.data?.error;
+          const metaDetails = metaError?.error_data?.details || metaError?.message || error.message;
+
+          // If the error is a fatal campaign-level error (e.g., Media ID expired/invalid or Template does not exist),
+          // abort the entire campaign immediately instead of failing every contact in the list!
+          if (
+            metaDetails.includes("does not exist or has expired") ||
+            metaError?.code === 132001
+          ) {
+            console.error(
+              `🛑 Aborting campaign "${campaign.name}" due to fatal template/media error: ${metaDetails}`,
+            );
+            throw new Error(`Fatal campaign error: ${metaDetails}`);
+          }
+
           // Log failure but continue to next contact — don't crash the whole loop
           console.error(
-            `Failed to send to ${contact.phoneNumber}: ${error.message}`,
+            `Failed to send to ${contact.phoneNumber}: ${metaDetails}`,
           );
 
           // Create Analytics record for failed message
@@ -335,7 +365,7 @@ const processCampaignBackground = async (campaignId, options = {}) => {
               campaign: campaign._id,
               contact: contact._id,
               status: "failed",
-              failureReason: error.message,
+              failureReason: metaDetails,
             });
           } catch (analyticsErr) {
             console.error("Analytics save error:", analyticsErr.message);

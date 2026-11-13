@@ -166,7 +166,22 @@ const createCampaign = async (req, res) => {
         });
       }
 
-      // 2. Upload to Meta
+      // 2. Upload backup copy to Cloudinary (so if Meta Media ID ever expires, headerImageUrl works as fallback)
+      try {
+        const { uploadToCloudinary } = require("../integrations/cloudinary");
+        const cloudResult = await uploadToCloudinary(
+          fs.createReadStream(req.file.path),
+          `campaign_header_${Date.now()}`,
+          "whatsapp_campaigns",
+        );
+        if (cloudResult?.secure_url) {
+          finalHeaderImageUrl = cloudResult.secure_url;
+        }
+      } catch (cloudErr) {
+        console.warn("⚠️ Optional Cloudinary backup upload skipped:", cloudErr.message);
+      }
+
+      // 3. Upload to Meta
       try {
         finalHeaderMediaId = await uploadMedia(
           req.file,
@@ -174,8 +189,6 @@ const createCampaign = async (req, res) => {
           phoneDoc.phoneNumberId,
         );
         console.log(`✅ Media uploaded to Meta. ID: ${finalHeaderMediaId}`);
-        // We don't need a URL if we have an ID, but we can clear it to be safe
-        finalHeaderImageUrl = "";
       } catch (uploadError) {
         return res.status(500).json({
           success: false,

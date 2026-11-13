@@ -9,6 +9,8 @@ const API_VERSION = "v20.0";
 
 // Memory cache for template structures to prevent redundant API fetches
 const templateCache = {};
+// Memory cache for recovered Media IDs when a campaign's headerMediaId has expired
+const recoveredMediaCache = {};
 
 /**
  * Sends a simple text message.
@@ -270,8 +272,15 @@ const sendTemplateMessage = async (
     components.push(carouselComponent);
   } else if (options.headerMediaId || options.headerImageUrl) {
     const headerFormat = options.headerMediaType ? options.headerMediaType.toLowerCase() : "image";
-    
-    if (options.headerMediaId) {
+    const recoveryKey = options.headerMediaId ? `${phoneNumberId}:${options.headerMediaId}` : null;
+    const cachedRecovery = recoveryKey ? recoveredMediaCache[recoveryKey] : null;
+
+    if (cachedRecovery) {
+      components.push({
+        type: "header",
+        parameters: [{ type: headerFormat, [headerFormat]: cachedRecovery }],
+      });
+    } else if (options.headerMediaId) {
       components.push({
         type: "header",
         parameters: [{ type: headerFormat, [headerFormat]: { id: options.headerMediaId } }],
@@ -331,6 +340,168 @@ const sendTemplateMessage = async (
     const response = await axios.post(url, data, { headers, timeout: 15000 });
     return response.data;
   } catch (error) {
+    const metaDetails = error.response?.data?.error?.error_data?.details || "";
+    const headerCompIndex = components.findIndex((c) => c.type === "header");
+
+    // If headerMediaId expired or does not exist for this phoneNumberId, attempt automatic recovery
+    if (
+      options.headerMediaId &&
+      headerCompIndex !== -1 &&
+      metaDetails.includes("does not exist or has expired")
+    ) {
+      const headerFormat = options.headerMediaType
+        ? options.headerMediaType.toLowerCase()
+        : "image";
+      const recoveryKey = `${phoneNumberId}:${options.headerMediaId}`;
+      const Campaign = require("../models/Campaign");
+
+      console.warn(
+        `⚠️ Media ID ${options.headerMediaId} expired/invalid for template "${templateName}". Attempting auto-recovery...`,
+      );
+
+      // 1. Try options.headerImageUrl if present
+      if (options.headerImageUrl && options.headerImageUrl.startsWith("http")) {
+        try {
+          const mediaParam = { link: options.headerImageUrl };
+          components[headerCompIndex] = {
+            type: "header",
+            parameters: [{ type: headerFormat, [headerFormat]: mediaParam }],
+          };
+          const retryRes = await axios.post(url, data, { headers, timeout: 15000 });
+          recoveredMediaCache[recoveryKey] = mediaParam;
+          console.log(`✅ Auto-recovered header media using campaign headerImageUrl.`);
+          return retryRes.data;
+        } catch (retryErr) {
+          console.warn("⚠️ Fallback headerImageUrl also failed:", retryErr.message);
+        }
+      }
+
+      // 2. Try valid headerMediaId or headerImageUrl from sibling campaigns using the same templateName
+      try {
+        const siblingCampaigns = await Campaign.find({
+          templateName,
+          _id: { $ne: options.campaignId },
+        })
+          .sort({ createdAt: -1 })
+          .limit(10);
+
+        const triedValues = new Set([String(options.headerMediaId)]);
+        for (const sib of siblingCampaigns) {
+          const candidates = [];
+          if (sib.headerMediaId && !triedValues.has(String(sib.headerMediaId))) {
+            triedValues.add(String(sib.headerMediaId));
+            candidates.push({ param: { id: sib.headerMediaId }, dbUpdate: { headerMediaId: sib.headerMediaId } });
+          }
+          if (sib.headerImageUrl && sib.headerImageUrl.startsWith("http") && !triedValues.has(sib.headerImageUrl)) {
+            triedValues.add(sib.headerImageUrl);
+            candidates.push({ param: { link: sib.headerImageUrl }, dbUpdate: { headerImageUrl: sib.headerImageUrl } });
+          }
+
+          for (const cand of candidates) {
+            try {
+              components[headerCompIndex] = {
+                type: "header",
+                parameters: [{ type: headerFormat, [headerFormat]: cand.param }],
+              };
+              const retryRes = await axios.post(url, data, { headers, timeout: 15000 });
+              recoveredMediaCache[recoveryKey] = cand.param;
+              if (options.campaignId) {
+                await Campaign.findByIdAndUpdate(options.campaignId, cand.dbUpdate);
+              }
+              console.log(
+                `✅ Auto-recovered header media from sibling campaign "${sib.name}":`,
+                cand.param,
+              );
+              return retryRes.data;
+            } catch (candErr) {
+              // Continue trying next candidate
+            }
+          }
+        }
+      } catch (sibErr) {
+        console.warn("⚠️ Error checking sibling campaigns for media recovery:", sibErr.message);
+      }
+
+      // 3. Try recovering from MediaMap or the template's HEADER example handle on Meta
+      try {
+        const PhoneNumber = require("../models/PhoneNumber");
+        const MediaMap = require("../models/MediaMap");
+        const phone = await PhoneNumber.findOne({ phoneNumberId }).populate("wabaAccount");
+        const waba = phone ? phone.wabaAccount : null;
+
+        let sourceUrl = null;
+        const mappedMedia = await MediaMap.findOne({ templateName }).sort({ _id: -1 });
+        if (mappedMedia && mappedMedia.url && mappedMedia.url.startsWith("http")) {
+          sourceUrl = mappedMedia.url;
+        } else if (waba) {
+          const tRes = await axios.get(
+            `https://graph.facebook.com/${API_VERSION}/${waba.businessAccountId}/message_templates`,
+            {
+              params: { name: templateName },
+              headers: { Authorization: `Bearer ${accessToken}` },
+            },
+          );
+          const templateDef = tRes.data?.data?.find((t) => t.name === templateName);
+          const headerComp = templateDef?.components?.find((c) => c.type === "HEADER");
+          const handleUrl = headerComp?.example?.header_handle?.[0];
+          if (handleUrl && handleUrl.startsWith("http")) {
+            sourceUrl = handleUrl;
+          }
+        }
+
+        if (sourceUrl) {
+          console.log(`🔄 Downloading template header media from ${sourceUrl} to re-upload to Meta...`);
+          const downloadRes = await axios.get(sourceUrl, { responseType: "arraybuffer", timeout: 15000 });
+          const buffer = Buffer.from(downloadRes.data, "binary");
+          const mimeType =
+            downloadRes.headers["content-type"] ||
+            (headerFormat === "video"
+              ? "video/mp4"
+              : headerFormat === "document"
+                ? "application/pdf"
+                : "image/jpeg");
+          const ext = headerFormat === "video" ? "mp4" : headerFormat === "document" ? "pdf" : "jpg";
+
+          const uploadForm = new FormData();
+          uploadForm.append("messaging_product", "whatsapp");
+          uploadForm.append("file", buffer, {
+            filename: `recovered_header.${ext}`,
+            contentType: mimeType,
+          });
+
+          const uploadRes = await axios.post(
+            `https://graph.facebook.com/${API_VERSION}/${phoneNumberId}/media`,
+            uploadForm,
+            {
+              headers: {
+                ...uploadForm.getHeaders(),
+                Authorization: `Bearer ${accessToken}`,
+              },
+              timeout: 30000,
+            },
+          );
+
+          if (uploadRes.data?.id) {
+            const newMediaId = uploadRes.data.id;
+            const mediaParam = { id: newMediaId };
+            components[headerCompIndex] = {
+              type: "header",
+              parameters: [{ type: headerFormat, [headerFormat]: mediaParam }],
+            };
+            const retryRes = await axios.post(url, data, { headers, timeout: 15000 });
+            recoveredMediaCache[recoveryKey] = mediaParam;
+            if (options.campaignId) {
+              await Campaign.findByIdAndUpdate(options.campaignId, { headerMediaId: newMediaId });
+            }
+            console.log(`✅ Re-uploaded & recovered fresh Meta Media ID: ${newMediaId}`);
+            return retryRes.data;
+          }
+        }
+      } catch (metaRecoverErr) {
+        console.warn("⚠️ Template header handle recovery failed:", metaRecoverErr.message);
+      }
+    }
+
     console.error(
       "❌ Error sending WhatsApp template message:",
       error.response ? error.response.data : error.message

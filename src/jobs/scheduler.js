@@ -7,10 +7,31 @@ const { sendCampaign, isCampaignActive } = require("../services/campaignService"
 const Log = require("../models/Log");
 const { getIO } = require("../socketManager");
 
-// Automatically recover any campaigns that were in "sending" status when the backend restarted
+// Automatically recover any recent campaigns that were in "sending" status when the backend restarted
 const resumeInterruptedCampaigns = async () => {
   try {
-    const sendingCampaigns = await Campaign.find({ status: "sending" });
+    const twelveHoursAgo = new Date(Date.now() - 12 * 60 * 60 * 1000);
+
+    // 1. Mark stale "sending" campaigns (older than 12 hours) as "paused" so old abandoned campaigns don't auto-run
+    const staleCampaigns = await Campaign.find({
+      status: "sending",
+      createdAt: { $lt: twelveHoursAgo },
+    });
+    for (const stale of staleCampaigns) {
+      if (!isCampaignActive(stale._id)) {
+        console.log(
+          `⏸️ Marking stale sending campaign "${stale.name}" (${stale._id}) as paused.`,
+        );
+        stale.status = "paused";
+        await stale.save();
+      }
+    }
+
+    // 2. Auto-resume only recent active campaigns (created within the last 12 hours)
+    const sendingCampaigns = await Campaign.find({
+      status: "sending",
+      createdAt: { $gte: twelveHoursAgo },
+    });
     for (const campaign of sendingCampaigns) {
       if (!isCampaignActive(campaign._id)) {
         console.log(
