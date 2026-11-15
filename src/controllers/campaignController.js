@@ -197,13 +197,34 @@ const createCampaign = async (req, res) => {
       }
     }
 
+    const sanitizedExclusionList =
+      exclusionList &&
+      exclusionList !== "" &&
+      exclusionList !== "null" &&
+      exclusionList !== "undefined"
+        ? exclusionList
+        : null;
+
+    let parsedTargetStatuses = [];
+    if (targetStatuses) {
+      if (Array.isArray(targetStatuses)) {
+        parsedTargetStatuses = targetStatuses;
+      } else {
+        try {
+          parsedTargetStatuses = JSON.parse(targetStatuses);
+        } catch (e) {
+          parsedTargetStatuses = [];
+        }
+      }
+    }
+
     const campaignData = {
       name,
       message,
       templateName,
       templateLanguage,
       contactList,
-      exclusionList,
+      ...(sanitizedExclusionList ? { exclusionList: sanitizedExclusionList } : {}),
       phoneNumber,
       status: scheduledFor ? "scheduled" : "draft",
 
@@ -212,7 +233,7 @@ const createCampaign = async (req, res) => {
       headerMediaId: finalHeaderMediaId,
       headerMediaType: headerMediaType || "IMAGE",
 
-      targetStatuses: targetStatuses ? JSON.parse(targetStatuses) : [], // Store the filter
+      targetStatuses: parsedTargetStatuses, // Store the filter
 
       expectedVariables: parseInt(expectedVariables, 10) || 0,
       buttons,

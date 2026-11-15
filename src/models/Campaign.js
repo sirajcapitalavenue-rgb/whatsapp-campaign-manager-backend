@@ -34,7 +34,12 @@ const CampaignSchema = new mongoose.Schema(
     scheduledFor: { type: Date },
     replyCount: { type: Number, default: 0 },
     buttons: [ButtonSchema],
-    exclusionList: { type: mongoose.Schema.Types.ObjectId, ref: "ContactList" },
+    exclusionList: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "ContactList",
+      default: null,
+      set: (v) => (!v || v === "" || v === "null" || v === "undefined" ? null : v),
+    },
     targetStatuses: [{ type: String }], // e.g. ["Engaged", "Unresponsive", "New"]
 
     // --- THIS IS THE NEW FIELD ---
