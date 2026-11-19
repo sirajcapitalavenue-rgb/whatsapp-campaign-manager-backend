@@ -181,11 +181,17 @@ const getAssignedPhoneNumberObjectIds = async (user) => {
 
 /**
  * Throws a 403 error if a non-admin user tries to edit/delete a Contact List
- * that they did not create.
+ * that they did not create and were not assigned by an admin.
  */
 const verifyContactListMutationAccess = async (user, listId) => {
   if (!user) throw new Error("Unauthorized");
   if (user.role === "admin") return;
+
+  if (user.role !== "manager") {
+    const err = new Error("You are not authorized to modify contact lists.");
+    err.statusCode = 403;
+    throw err;
+  }
 
   const list = await ContactList.findById(listId);
   if (!list) {
@@ -194,9 +200,16 @@ const verifyContactListMutationAccess = async (user, listId) => {
     throw err;
   }
 
-  const isCreator = list.createdBy && list.createdBy.toString() === user._id.toString();
-  if (!isCreator) {
-    const err = new Error("You are not authorized to edit or delete contact lists created by others.");
+  const isAssigned = (user.assignedContactLists || [])
+    .map((id) => id.toString())
+    .includes(listId.toString());
+  const isCreator =
+    list.createdBy && list.createdBy.toString() === user._id.toString();
+
+  if (!isAssigned && !isCreator) {
+    const err = new Error(
+      "You are not authorized to edit or delete this contact list."
+    );
     err.statusCode = 403;
     throw err;
   }
@@ -204,22 +217,23 @@ const verifyContactListMutationAccess = async (user, listId) => {
 
 /**
  * Throws a 403 error if a non-admin user tries to edit/delete a Contact
- * belonging to a Contact List they did not create.
+ * belonging to a Contact List they did not create and were not assigned.
  */
 const verifyContactMutationAccess = async (user, contact) => {
   if (!user) throw new Error("Unauthorized");
   if (user.role === "admin") return;
 
+  if (user.role !== "manager") {
+    const err = new Error("You are not authorized to modify contacts.");
+    err.statusCode = 403;
+    throw err;
+  }
+
   if (contact.contactList) {
-    const list = await ContactList.findById(contact.contactList._id || contact.contactList);
-    if (list) {
-      const isCreator = list.createdBy && list.createdBy.toString() === user._id.toString();
-      if (!isCreator) {
-        const err = new Error("You can only edit or delete contacts in contact lists created by yourself.");
-        err.statusCode = 403;
-        throw err;
-      }
-    }
+    await verifyContactListMutationAccess(
+      user,
+      contact.contactList._id || contact.contactList
+    );
   } else {
     await verifyContactAccess(user, contact);
   }

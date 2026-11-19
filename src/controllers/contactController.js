@@ -163,36 +163,82 @@ const getListStatusCounts = async (req, res) => {
 };
 
 
-// --- NEW FUNCTION FOR PASTED DATA ---
+// --- NEW FUNCTION FOR PASTED / ADDED DATA ---
 const bulkAddContacts = async (req, res) => {
-  const { listId } = req.params;
-  const { contacts } = req.body;
-
-  if (!contacts || !Array.isArray(contacts) || contacts.length === 0) {
-    return res
-      .status(400)
-      .json({ success: false, error: "No contacts provided." });
-  }
-
-  // Process each contact to match our database schema
-  const processedContacts = contacts.map((contact) => ({
-    phoneNumber: String(contact.phoneNumber),
-    name: contact.name,
-    contactList: listId,
-    variables: extractVariables(contact),
-  }));
-
   try {
-    await Contact.insertMany(processedContacts, { ordered: false });
-    getIO().emit("campaignsUpdated"); // <-- 2. EMIT EVENT
-    res.status(201).json({
-      success: true,
-      message: `${contacts.length} contacts were processed successfully.`,
-    });
+    const { listId } = req.params;
+    const { contacts } = req.body;
+
+    await verifyContactListMutationAccess(req.user, listId);
+
+    if (!contacts || !Array.isArray(contacts) || contacts.length === 0) {
+      return res
+        .status(400)
+        .json({ success: false, error: "No contacts provided." });
+    }
+
+    // Filter out rows without a valid phoneNumber and normalize
+    const validContacts = contacts.filter(
+      (c) => c && c.phoneNumber && String(c.phoneNumber).trim() !== ""
+    );
+
+    if (validContacts.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: "No valid phone numbers found in the provided contacts.",
+      });
+    }
+
+    // Process each contact to match our database schema
+    const processedContacts = validContacts.map((contact) => ({
+      phoneNumber: String(contact.phoneNumber).trim(),
+      name: contact.name ? String(contact.name).trim() : "",
+      contactList: listId,
+      variables: extractVariables(contact),
+    }));
+
+    try {
+      const inserted = await Contact.insertMany(processedContacts, {
+        ordered: false,
+      });
+      getIO().emit("campaignsUpdated");
+      return res.status(201).json({
+        success: true,
+        message: `${inserted.length} contact(s) added successfully.`,
+      });
+    } catch (insertErr) {
+      // With ordered: false, MongoDB inserts non-duplicate documents even if some duplicates throw code 11000
+      const insertedCount =
+        insertErr.insertedDocs?.length ??
+        insertErr.result?.insertedCount ??
+        Math.max(
+          0,
+          processedContacts.length - (insertErr.writeErrors?.length || 0)
+        );
+
+      if (insertedCount > 0 || insertErr.code === 11000) {
+        getIO().emit("campaignsUpdated");
+        const dupCount = processedContacts.length - insertedCount;
+        return res.status(201).json({
+          success: true,
+          message:
+            insertedCount > 0
+              ? `${insertedCount} contact(s) added (${dupCount} duplicate(s) skipped).`
+              : `All ${dupCount} contact(s) already exist in this list.`,
+        });
+      }
+
+      throw insertErr;
+    }
   } catch (error) {
+    if (error.statusCode) {
+      return res
+        .status(error.statusCode)
+        .json({ success: false, error: error.message });
+    }
     res.status(400).json({
       success: false,
-      message: `Import failed. Some contacts may have been duplicates within this list.`,
+      message: `Import failed. ${error.message}`,
       error: error.message,
     });
   }
@@ -244,6 +290,51 @@ const updateContact = async (req, res) => {
       return res.status(error.statusCode).json({ success: false, error: error.message });
     }
     res.status(500).json({ success: false, error: "Server Error" });
+  }
+};
+
+// --- UPDATE / RENAME CONTACT LIST FUNCTION ---
+const updateContactList = async (req, res) => {
+  try {
+    const { listId } = req.params;
+    const { name } = req.body;
+
+    if (!name || !name.trim()) {
+      return res
+        .status(400)
+        .json({ success: false, error: "Please provide a valid list name." });
+    }
+
+    await verifyContactListMutationAccess(req.user, listId);
+
+    const list = await ContactList.findById(listId);
+    if (!list) {
+      return res
+        .status(404)
+        .json({ success: false, error: "Contact list not found" });
+    }
+
+    const oldName = list.name;
+    list.name = name.trim();
+    await list.save();
+
+    await Log.create({
+      level: "info",
+      message: `Contact List '${oldName}' renamed to '${list.name}' by user ${req.user.name} (${req.user.email}).`,
+      performedBy: req.user._id,
+    });
+
+    getIO().emit("campaignsUpdated");
+    res.status(200).json({ success: true, data: list });
+  } catch (error) {
+    if (error.statusCode) {
+      return res
+        .status(error.statusCode)
+        .json({ success: false, error: error.message });
+    }
+    res
+      .status(400)
+      .json({ success: false, error: "List name may already exist." });
   }
 };
 
@@ -318,10 +409,9 @@ const bulkDeleteContacts = async (req, res) => {
     }
 
     if (req.user.role !== 'admin') {
-      const listsCreatedByManager = await ContactList.find({ createdBy: req.user._id }).select("_id");
-      const listIds = listsCreatedByManager.map(l => l._id);
-      // Delete only contacts within lists created by manager
-      await Contact.deleteMany({ _id: { $in: contactIds }, contactList: { $in: listIds } });
+      const allowedListIds = await getAssignedContactListIds(req.user);
+      // Delete contacts within lists assigned to or created by manager
+      await Contact.deleteMany({ _id: { $in: contactIds }, contactList: { $in: allowedListIds } });
     } else {
       await Contact.deleteMany({ _id: { $in: contactIds } });
     }
@@ -743,6 +833,7 @@ module.exports = {
   getAllContactLists,
   bulkAddContacts,
   getContactsInList,
+  updateContactList,
   deleteContactList,
   deleteContact,
   updateContact,

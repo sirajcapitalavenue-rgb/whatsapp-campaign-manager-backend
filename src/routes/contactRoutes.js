@@ -6,6 +6,7 @@ const {
   getAllContactLists,
   bulkAddContacts,
   getContactsInList,
+  updateContactList,
   deleteContactList,
   updateContact, // <-- 1. IMPORT
   deleteContact, // <-- 1. IMPORT
@@ -59,12 +60,18 @@ router
   .post(protect, authorize("admin", "manager"), createContactList);
 
 // --- 2. THIS IS THE NEW ROUTE for pasted data ---
-router.post("/lists/:listId/bulk-add", protect, bulkAddContacts);
+router.post(
+  "/lists/:listId/bulk-add",
+  protect,
+  authorize("admin", "manager"),
+  bulkAddContacts,
+);
 
-// --- 3. ADD DELETE METHOD TO THIS ROUTE ---
-// This route now handles uploading to AND deleting a specific list
+// --- 3. ADD PUT AND DELETE METHOD TO THIS ROUTE ---
+// This route now handles updating AND deleting a specific list
 router
   .route("/lists/:listId")
+  .put(protect, authorize("admin", "manager"), updateContactList)
   .delete(protect, authorize("admin", "manager"), deleteContactList);
 
 // --- 4. NEW ROUTE to get all contacts in a list ---
